@@ -6,7 +6,7 @@ import Carbon.HIToolbox
 import ApplicationServices
 import ServiceManagement
 
-let appVersion = "2.1.0"
+let appVersion = "2.1.1"
 
 // MARK: - Typing model (shared by the app and the CLI)
 
@@ -454,10 +454,7 @@ final class Engine: ObservableObject {
         if isActive { stop() }
         let source = Typing.clean(sourceText, quotes: cleanQuotes, tabs: cleanTabs, trailing: cleanTrailing)
         guard !source.isEmpty else { NSSound.beep(); return }
-        guard Mash.install() else {
-            notice("Mash mode couldn't start", "Make sure DripWriter is switched on in System Settings → Privacy & Security → Accessibility.")
-            return
-        }
+        guard Mash.install() else { Accessibility.explainMashBlocked(); return }
         chars = Array(source); pos = 0; total = chars.count; typosFixed = 0
         Keys.targetPID = nil
         mashing = true
@@ -600,14 +597,59 @@ enum Accessibility {
         let a = NSAlert()
         a.icon = NSApp.applicationIconImage
         a.messageText = "Let DripWriter type for you"
-        a.informativeText = "macOS needs your OK before an app can press keys in other apps.\n\nOpen System Settings → Privacy & Security → Accessibility, switch on DripWriter, then press Start again."
-        a.addButton(withTitle: "Open Settings"); a.addButton(withTitle: "Not now")
+        a.informativeText = """
+        macOS needs your OK before an app can press keys in other apps. In System Settings → Privacy & Security → Accessibility, switch on DripWriter, then try again.
+
+        Already switched on? macOS is remembering an older copy of DripWriter. Click Fix It to clear the old entry, then switch DripWriter on again.
+        """
+        a.addButton(withTitle: "Open Settings"); a.addButton(withTitle: "Fix It"); a.addButton(withTitle: "Not now")
         NSApp.activate(ignoringOtherApps: true)
-        if a.runModal() == .alertFirstButtonReturn { openSettings() }
+        switch a.runModal() {
+        case .alertFirstButtonReturn: openSettings()
+        case .alertSecondButtonReturn: fixStale()
+        default: break
+        }
         return false
     }
-    static func openSettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(url) }
+
+    /// Clears macOS's remembered permission for an older build of DripWriter, so the switch in Settings matches this copy.
+    @MainActor static func fixStale(pane: String = "Privacy_Accessibility") {
+        for service in ["Accessibility", "ListenEvent"] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            p.arguments = ["reset", service, Bundle.main.bundleIdentifier ?? "tech.rennko.dripwriter"]
+            try? p.run(); p.waitUntilExit()
+        }
+        // asking again puts this copy of DripWriter back in the list, switched off, ready to switch on
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+        openSettings(pane)
+    }
+
+    static func openSettings(_ pane: String = "Privacy_Accessibility") {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") { NSWorkspace.shared.open(url) }
+    }
+
+    /// Mash mode reads your key presses, which macOS also files under Input Monitoring.
+    @MainActor static func explainMashBlocked() {
+        _ = CGRequestListenEventAccess()
+        let a = NSAlert()
+        a.icon = NSApp.applicationIconImage
+        a.messageText = "Mash mode needs one more permission"
+        a.informativeText = """
+        Mash mode swaps the keys you press for your text, so macOS also asks for Input Monitoring.
+
+        In System Settings → Privacy & Security → Input Monitoring, switch on DripWriter, then press ⌃⌥⌘M again.
+
+        Already on in both Accessibility and Input Monitoring? Click Fix It to clear the old entries, then switch DripWriter on again.
+        """
+        a.addButton(withTitle: "Open Input Monitoring"); a.addButton(withTitle: "Fix It"); a.addButton(withTitle: "Not now")
+        NSApp.activate(ignoringOtherApps: true)
+        switch a.runModal() {
+        case .alertFirstButtonReturn: openSettings("Privacy_ListenEvent")
+        case .alertSecondButtonReturn: fixStale()
+        default: break
+        }
     }
 }
 

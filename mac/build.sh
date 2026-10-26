@@ -32,7 +32,14 @@ cat > "$APP/Contents/Info.plist" <<PL
 <key>NSHumanReadableCopyright</key><string>Made by Virat Reddy Kaukuntla</string>
 </dict></plist>
 PL
-codesign --force --deep -s - "$APP"
+# Sign with a real certificate when there is one: macOS ties the Accessibility permission to the signature,
+# so a stable identity keeps the permission across updates (an ad-hoc signature changes every build).
+SIGN_ID="${SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null | grep -oE '"(Developer ID Application|Apple Development)[^"]*"' | head -1 | tr -d '"')}"
+if [[ -n "$SIGN_ID" ]]; then
+  codesign --force --deep --timestamp=none -s "$SIGN_ID" "$APP" && echo "Signed with $SIGN_ID"
+else
+  codesign --force --deep -s - "$APP" && echo "Signed ad-hoc (no certificate found)"
+fi
 (cd build && ditto -c -k --keepParent DripWriter.app DripWriter-macOS.zip)
 echo "Built $APP ($VERSION) and build/DripWriter-macOS.zip"
 if [[ "${1:-}" == "--install" ]]; then
