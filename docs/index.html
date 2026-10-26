@@ -63,6 +63,9 @@ footer a{color:inherit}
   <h2>What it does</h2>
   <div class="grid">
     <div class="f"><b>Types anywhere</b><span>Docs, Notes, Slack, Discord, VS Code, browsers, terminals.</span></div>
+    <div class="f"><b>In the background</b><span>Keeps typing into an app while you watch a video somewhere else.</span></div>
+    <div class="f"><b>Mash mode</b><span>Smash any keys. Your text comes out instead.</span></div>
+    <div class="f"><b>Start at, done by</b><span>Schedule a start, set an end time, add up to three breaks.</span></div>
     <div class="f"><b>Finish in…</b><span>Pick a speed, or a deadline and let it work out the pace.</span></div>
     <div class="f"><b>Five rhythms</b><span>Human, Steady, Nervous, Burst and Drip.</span></div>
     <div class="f"><b>Real typos</b><span>Hits a neighboring key, backspaces, fixes it.</span></div>
@@ -76,6 +79,7 @@ footer a{color:inherit}
   <table>
     <tr><td><kbd>⌃⌥⌘V</kbd></td><td>Type the clipboard at your cursor</td></tr>
     <tr><td><kbd>⌃⌥⌘D</kbd></td><td>Start or pause</td></tr>
+    <tr><td><kbd>⌃⌥⌘M</kbd></td><td>Mash mode: any keys type your text</td></tr>
     <tr><td><kbd>⌃⌥⌘↑</kbd> <kbd>⌃⌥⌘↓</kbd></td><td>Faster or slower while typing</td></tr>
     <tr><td><kbd>esc</kbd></td><td>Stop</td></tr>
   </table>
@@ -84,6 +88,8 @@ footer a{color:inherit}
 <pre>dripwriter "hello world"            <i># type into the front app</i>
 dripwriter -f essay.txt -w 90 -T 2  <i># 90 wpm, 2% typos</i>
 pbpaste | dripwriter -t 5m          <i># finish in five minutes</i>
+dripwriter -f essay.txt -a Notes    <i># into Notes, in the background</i>
+dripwriter -f essay.txt --at 9am -u 5pm -b 12:00-13:00
 dripwriter --dry -f essay.txt       <i># how long would it take?</i></pre>
 
   <footer>Made by Virat Reddy Kaukuntla · <a href="https://github.com/learningnihongo934-byte/dripwriter">Source on GitHub</a> · <a href="https://rennko.tech">rennko.tech</a></footer>

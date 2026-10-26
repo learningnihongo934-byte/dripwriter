@@ -6,7 +6,7 @@ import Carbon.HIToolbox
 import ApplicationServices
 import ServiceManagement
 
-let appVersion = "2.0.0"
+let appVersion = "2.1.0"
 
 // MARK: - Typing model (shared by the app and the CLI)
 
@@ -65,6 +65,43 @@ enum Typing {
         return t
     }
 
+    /// Daily windows (minutes after midnight) laid out as real date intervals covering a...b.
+    static func intervals(_ windows: [(Int, Int)], from a: Date, to b: Date) -> [DateInterval] {
+        let cal = Calendar.current
+        var out: [DateInterval] = []
+        var day = cal.date(byAdding: .day, value: -1, to: cal.startOfDay(for: a))!
+        while day <= b {
+            for (s, e) in windows {
+                let st = cal.date(byAdding: .minute, value: s, to: day)!
+                var en = cal.date(byAdding: .minute, value: e, to: day)!
+                if e <= s { en = cal.date(byAdding: .day, value: 1, to: en)! }
+                out.append(DateInterval(start: st, end: en))
+            }
+            day = cal.date(byAdding: .day, value: 1, to: day)!
+        }
+        return out
+    }
+
+    /// When the break you're in right now ends, if you're in one.
+    static func breakEnd(_ windows: [(Int, Int)], at now: Date = Date()) -> Date? {
+        intervals(windows, from: now, to: now).filter { $0.start <= now && now < $0.end }.map(\.end).max()
+    }
+
+    /// Seconds between a and b that aren't inside a break.
+    static func workSeconds(_ windows: [(Int, Int)], from a: Date, to b: Date) -> Double {
+        guard b > a else { return 0 }
+        var busy = 0.0, cursor = a
+        for iv in intervals(windows, from: a, to: b).sorted(by: { $0.start < $1.start }) {
+            let s = max(iv.start, cursor), e = min(iv.end, b)
+            if e > s { busy += e.timeIntervalSince(s); cursor = e }
+        }
+        return b.timeIntervalSince(a) - busy
+    }
+
+    static func nextTime(minutes m: Int, after d: Date) -> Date {
+        Calendar.current.nextDate(after: d, matching: DateComponents(hour: m / 60, minute: m % 60), matchingPolicy: .nextTime) ?? d
+    }
+
     static func speedLabel(_ cps: Double) -> String { cps < 20 ? "\(Int((cps * 12).rounded())) wpm" : "\(Int(cps)) keys/s" }
     static func clock(_ s: Double) -> String {
         let t = max(0, Int(s.rounded()))
@@ -76,6 +113,15 @@ enum Typing {
 
 enum Keys {
     private static let src = CGEventSource(stateID: .hidSystemState)
+    /// Tags our own synthetic events so Mash mode's event tap lets them through.
+    static let marker: Int64 = 0x4452_5754
+    /// When set, keys go straight to this app even while it's in the background.
+    static var targetPID: pid_t?
+
+    private static func post(_ e: CGEvent) {
+        e.setIntegerValueField(.eventSourceUserData, value: marker)
+        if let pid = targetPID { e.postToPid(pid) } else { e.post(tap: .cghidEventTap) }
+    }
     private static let rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"].map(Array.init)
 
     static func type(_ s: String) {
@@ -84,7 +130,7 @@ enum Keys {
             guard let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down) else { continue }
             e.flags = []
             e.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-            e.post(tap: .cghidEventTap)
+            post(e)
         }
     }
 
@@ -92,7 +138,7 @@ enum Keys {
         for down in [true, false] {
             guard let e = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(key), keyDown: down) else { continue }
             e.flags = flags
-            e.post(tap: .cghidEventTap)
+            post(e)
         }
     }
 
@@ -164,7 +210,8 @@ final class Engine: ObservableObject {
     @AppStorage("stripIndent") var stripIndent = false
     @AppStorage("countdown") var countdown = 3
     @AppStorage("useClipboard") var useClipboard = false
-    @AppStorage("finishIn") var finishIn = false
+    @AppStorage("paceMode") var paceMode = "speed"   // "speed", "in" (a duration) or "at" (a clock time)
+    @AppStorage("finishAtMinutes") var finishAtMinutes = 17 * 60
     @AppStorage("finishMinutes") var finishMinutes = 2.0
     @AppStorage("sound") var sound = "Off"
     @AppStorage("bell") var bell = true
@@ -177,6 +224,8 @@ final class Engine: ObservableObject {
     @AppStorage("lifetimeChars") var lifetimeChars = 0
     @AppStorage("lifetimeRuns") var lifetimeRuns = 0
     @AppStorage("lifetimeTypos") var lifetimeTypos = 0
+    @AppStorage("target") var target = "front"      // "front", "lock", or an app's bundle id
+    @AppStorage("mashPerKey") var mashPerKey = 1
 
     @Published var state: RunState = .idle
     @Published var pos = 0
@@ -187,6 +236,16 @@ final class Engine: ObservableObject {
     @Published var snippets: [Snippet] = [] { didSet { save("snippets", snippets) } }
     @Published var history: [Snippet] = [] { didSet { save("history", history) } }
     @Published var showTestRun = false
+    @Published var scheduleTime = Date().addingTimeInterval(600)
+    @Published var scheduledAt: Date?
+    @Published var targetName = ""
+    @Published var mashing = false
+    @Published var runningApps: [AppChoice] = []
+    @Published var breaks: [BreakWindow] = [] { didSet { save("breaks", breaks) } }
+    @Published var breakUntil: Date?
+    @Published var deadline: Date?
+    private var scheduleTask: Task<Void, Never>?
+    private var awake: NSObjectProtocol?
 
     private var task: Task<Void, Never>?
     private var chars: [Character] = []
@@ -200,6 +259,9 @@ final class Engine: ObservableObject {
             Snippet(name: "Fibonacci in Python", text: "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n"),
         ]
         history = load("history") ?? []
+        breaks = load("breaks") ?? [BreakWindow(start: 12 * 60, end: 12 * 60 + 30),
+                                    BreakWindow(start: 15 * 60, end: 15 * 60 + 15),
+                                    BreakWindow(start: 18 * 60, end: 18 * 60 + 45)]
     }
 
     var rhythm: Rhythm { Rhythm(rawValue: rhythmRaw) ?? .human }
@@ -208,8 +270,13 @@ final class Engine: ObservableObject {
     var cps: Double { paceOverride ?? sliderCPS }
     var speedLabel: String { finishIn && state == .idle ? "in \(Typing.clock(finishMinutes * 60))" : Typing.speedLabel(cps) }
     var progress: Double { total == 0 ? 0 : Double(pos) / Double(total) }
-    var etaSeconds: Double { Double(total - pos) / cps * rhythm.etaFactor }
+    var etaSeconds: Double { deadline.map { max(0, $0.timeIntervalSinceNow) } ?? Double(total - pos) / cps * rhythm.etaFactor }
     var isActive: Bool { state == .typing || state == .paused || state == .countdown }
+    var finishIn: Bool { paceMode == "in" }
+    var finishAt: Bool { paceMode == "at" }
+    var activeBreaks: [(Int, Int)] { breaks.filter(\.on).map { ($0.start, $0.end) } }
+    var targetIsApp: Bool { target != "front" && target != "lock" }
+    var targetAppName: String { runningApps.first { $0.id == target }?.name ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: target)?.deletingPathExtension().lastPathComponent ?? target }
     var sourceText: String { useClipboard ? (NSPasteboard.general.string(forType: .string) ?? "") : text }
 
     // MARK: control
@@ -223,8 +290,18 @@ final class Engine: ObservableObject {
         }
     }
 
-    func start(fromClipboard: Bool? = nil, hide: Bool = true, countdownOverride: Int? = nil) {
+    func start(fromClipboard: Bool? = nil, hide: Bool = true, countdownOverride: Int? = nil, tryIt: Bool = false) {
         guard Accessibility.ensure() else { return }
+        if mashing { stopMash() }
+        var pid: pid_t?
+        if targetIsApp && !tryIt {
+            guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: target).first else {
+                notice("\(targetAppName) isn't open", "Open it, put your cursor where the text should go, then start again.")
+                return
+            }
+            pid = app.processIdentifier
+            targetName = app.localizedName ?? targetAppName
+        }
         let clip = fromClipboard ?? useClipboard
         var source = clip ? (NSPasteboard.general.string(forType: .string) ?? "") : text
         source = Typing.clean(source, quotes: cleanQuotes, tabs: cleanTabs, trailing: cleanTrailing)
@@ -234,13 +311,18 @@ final class Engine: ObservableObject {
         paceOverride = finishIn ? Double(total) * rhythm.etaFactor / max(5, finishMinutes * 60) : nil
         hideWhenStarting = hide
         remember(source)
-        if hide, NSApp.isActive { NSApp.hide(nil) }
-        if showHUD && hide { HUD.show() }
-        task = Task { await run(countdown: countdownOverride ?? countdown) }
+        keepAwake(true)
+        if hide && pid == nil, NSApp.isActive { NSApp.hide(nil) }
+        if showHUD && !tryIt { HUD.show() }
+        let mode = tryIt ? "front" : target
+        task = Task { await run(countdown: pid == nil ? (countdownOverride ?? countdown) : 0, pid: pid, mode: mode) }
     }
 
     func stop() {
         task?.cancel(); task = nil
+        Keys.targetPID = nil
+        breakUntil = nil; deadline = nil
+        keepAwake(scheduledAt != nil)
         state = pos >= total && total > 0 ? .done : .idle
         autoPaused = false
         HUD.hideSoon()
@@ -253,27 +335,45 @@ final class Engine: ObservableObject {
     }
 
     func appSwitched(to pid: pid_t) {
-        guard pauseOnSwitch, let target = targetPID else { return }
+        guard pauseOnSwitch, target == "front", let target = targetPID else { return }
         if state == .typing && pid != target { state = .paused; autoPaused = true }
         else if state == .paused && autoPaused && pid == target { state = .typing; autoPaused = false }
     }
 
     // MARK: loop
 
-    private func run(countdown: Int) async {
+    private func run(countdown: Int, pid: pid_t?, mode: String) async {
         state = .countdown
         for i in stride(from: countdown, to: 0, by: -1) {
             countdownLeft = i
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             if Task.isCancelled { return }
         }
-        targetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if let pid { targetPID = pid } else {
+            let front = NSWorkspace.shared.frontmostApplication
+            targetPID = front?.processIdentifier
+            targetName = front?.localizedName ?? ""
+        }
+        // in background modes every key goes straight to the target, wherever you are
+        Keys.targetPID = mode == "front" ? nil : targetPID
+        deadline = finishAt ? Typing.nextTime(minutes: finishAtMinutes, after: Date()) : nil
         state = .typing
         lifetimeRuns += 1
         var atLineStart = false
         while pos < chars.count {
             if Task.isCancelled { return }
             if state == .paused { try? await Task.sleep(nanoseconds: 50_000_000); continue }
+            if let end = Typing.breakEnd(activeBreaks) {
+                breakUntil = end
+                while Date() < end && !Task.isCancelled { try? await Task.sleep(nanoseconds: 500_000_000) }
+                breakUntil = nil
+                continue
+            }
+            // aim for the finish time: re-pace from what's left, minus any breaks still to come
+            if let d = deadline, pos % 10 == 0 {
+                let avail = Typing.workSeconds(activeBreaks, from: Date(), to: d)
+                paceOverride = min(400, max(0.02, Double(chars.count - pos) * rhythm.etaFactor / max(1, avail)))
+            }
             let ch = chars[pos]
 
             // editors that auto-indent would double the indentation; skip it and let them indent
@@ -299,6 +399,9 @@ final class Engine: ObservableObject {
         }
         state = .done
         paceOverride = nil
+        deadline = nil
+        Keys.targetPID = nil
+        keepAwake(scheduledAt != nil)
         if sound != "Off" || bell { NSSound(named: "Glass")?.play() }
         HUD.hideSoon()
     }
@@ -310,6 +413,101 @@ final class Engine: ObservableObject {
         guard sound != "Off", let s = NSSound(named: NSSound.Name(sound)) else { return }
         s.volume = 0.35
         if !s.isPlaying { s.play() }
+    }
+
+    // MARK: schedule
+
+    func schedule() {
+        scheduleTask?.cancel()
+        let cal = Calendar.current
+        let hm = cal.dateComponents([.hour, .minute], from: scheduleTime)
+        guard let when = cal.nextDate(after: Date(), matching: hm, matchingPolicy: .nextTime) else { return }
+        scheduledAt = when
+        keepAwake(true)
+        scheduleTask = Task {
+            while Date() < when {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if Task.isCancelled { return }
+            }
+            scheduledAt = nil
+            start(hide: false, countdownOverride: 0)
+        }
+    }
+
+    func cancelSchedule() { scheduleTask?.cancel(); scheduleTask = nil; scheduledAt = nil; keepAwake(isActive) }
+
+    /// Stops the Mac idling to sleep while something is scheduled or typing.
+    private func keepAwake(_ on: Bool) {
+        if on, awake == nil {
+            awake = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .userInitiated], reason: "DripWriter is typing")
+        } else if !on, let a = awake {
+            ProcessInfo.processInfo.endActivity(a); awake = nil
+        }
+    }
+
+    // MARK: mash mode
+
+    func toggleMash() { mashing ? stopMash() : startMash() }
+
+    func startMash() {
+        guard Accessibility.ensure() else { return }
+        if isActive { stop() }
+        let source = Typing.clean(sourceText, quotes: cleanQuotes, tabs: cleanTabs, trailing: cleanTrailing)
+        guard !source.isEmpty else { NSSound.beep(); return }
+        guard Mash.install() else {
+            notice("Mash mode couldn't start", "Make sure DripWriter is switched on in System Settings → Privacy & Security → Accessibility.")
+            return
+        }
+        chars = Array(source); pos = 0; total = chars.count; typosFixed = 0
+        Keys.targetPID = nil
+        mashing = true
+        state = .idle
+        remember(source)
+        if showHUD { HUD.show() }
+    }
+
+    func stopMash() {
+        Mash.remove()
+        mashing = false
+        HUD.hideSoon()
+    }
+
+    /// Called by the event tap for each real key press. Returns true to swallow the key.
+    func mashKey(_ code: Int64, flags: CGEventFlags) -> Bool {
+        if flags.contains(.maskCommand) || flags.contains(.maskControl) { return false }
+        if code == Int64(kVK_Escape) { stopMash(); return true }
+        if code == Int64(kVK_Delete) { pos = max(0, pos - 1); return false }
+        for _ in 0..<max(1, mashPerKey) {
+            guard pos < chars.count else { break }
+            let ch = chars[pos]; pos += 1; lifetimeChars += 1
+            if ch == "\n" {
+                Keys.newline(newline)
+                // indentation comes along with the new line
+                while pos < chars.count, chars[pos] == " " || chars[pos] == "\t" {
+                    if !stripIndent { chars[pos] == "\t" ? Keys.tab() : Keys.type(" ") }
+                    pos += 1
+                }
+            } else if ch == "\t" { Keys.tab() } else { Keys.type(String(ch)) }
+            click(ch)
+        }
+        if pos >= chars.count {
+            state = .done
+            NSSound(named: "Glass")?.play()
+            stopMash()
+        }
+        return true
+    }
+
+    func refreshApps() {
+        runningApps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != Bundle.main.bundleIdentifier }
+            .compactMap { a in a.bundleIdentifier.map { AppChoice(id: $0, name: a.localizedName ?? $0) } }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func notice(_ title: String, _ body: String) {
+        let a = NSAlert(); a.icon = NSApp.applicationIconImage; a.messageText = title; a.informativeText = body
+        NSApp.activate(ignoringOtherApps: true); a.runModal()
     }
 
     // MARK: library
@@ -335,6 +533,60 @@ final class Engine: ObservableObject {
 
     private func save<T: Encodable>(_ key: String, _ v: T) { UserDefaults.standard.set(try? JSONEncoder().encode(v), forKey: key) }
     private func load<T: Decodable>(_ key: String) -> T? { UserDefaults.standard.data(forKey: key).flatMap { try? JSONDecoder().decode(T.self, from: $0) } }
+}
+
+struct AppChoice: Identifiable, Hashable { let id: String; let name: String }
+
+struct BreakWindow: Codable, Identifiable, Hashable {
+    var id = UUID()
+    var on = false
+    var start: Int       // minutes after midnight
+    var end: Int
+}
+
+/// Edits "minutes after midnight" with a time picker.
+func clockBinding(_ m: Binding<Int>) -> Binding<Date> {
+    Binding(get: { Calendar.current.date(bySettingHour: m.wrappedValue / 60, minute: m.wrappedValue % 60, second: 0, of: Date()) ?? Date() },
+            set: { let c = Calendar.current.dateComponents([.hour, .minute], from: $0); m.wrappedValue = (c.hour ?? 0) * 60 + (c.minute ?? 0) })
+}
+
+// MARK: - Mash mode event tap
+
+/// Swallows real key presses anywhere on the Mac and types the next characters of your text instead.
+enum Mash {
+    static var tap: CFMachPort?
+    static var loopSource: CFRunLoopSource?
+    static var swallowed = Set<Int64>()
+
+    static func install() -> Bool {
+        remove()
+        let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
+        guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                        eventsOfInterest: CGEventMask(mask), callback: { _, type, event, _ in
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let t = Mash.tap { CGEvent.tapEnable(tap: t, enable: true) }
+                return Unmanaged.passUnretained(event)
+            }
+            if event.getIntegerValueField(.eventSourceUserData) == Keys.marker { return Unmanaged.passUnretained(event) }
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            if type == .keyUp { return Mash.swallowed.remove(code) != nil ? nil : Unmanaged.passUnretained(event) }
+            let flags = event.flags
+            let swallow = MainActor.assumeIsolated { Engine.shared.mashKey(code, flags: flags) }
+            if swallow { Mash.swallowed.insert(code); return nil }
+            return Unmanaged.passUnretained(event)
+        }, userInfo: nil) else { return false }
+        tap = t
+        loopSource = CFMachPortCreateRunLoopSource(nil, t, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), loopSource, .commonModes)
+        CGEvent.tapEnable(tap: t, enable: true)
+        return true
+    }
+
+    static func remove() {
+        if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
+        if let s = loopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes) }
+        tap = nil; loopSource = nil
+    }
 }
 
 // MARK: - Accessibility
@@ -375,13 +627,14 @@ enum HotKeys {
                 case 2: e.start(fromClipboard: true)
                 case 3: e.stop()
                 case 4: e.nudgeSpeed(0.04)
+                case 6: e.toggleMash()
                 default: e.nudgeSpeed(-0.04)
                 }
             }
             return noErr
         }, 1, &spec, nil, nil)
         let mods = UInt32(controlKey | optionKey | cmdKey)
-        for (n, key) in [(1, kVK_ANSI_D), (2, kVK_ANSI_V), (3, kVK_ANSI_Period), (4, kVK_UpArrow), (5, kVK_DownArrow)] {
+        for (n, key) in [(1, kVK_ANSI_D), (2, kVK_ANSI_V), (3, kVK_ANSI_Period), (4, kVK_UpArrow), (5, kVK_DownArrow), (6, kVK_ANSI_M)] {
             var ref: EventHotKeyRef?
             RegisterEventHotKey(UInt32(key), mods, EventHotKeyID(signature: OSType(0x4452_5754), id: UInt32(n)), GetApplicationEventTarget(), 0, &ref)
         }
@@ -457,13 +710,7 @@ struct Card<Content: View>: View {
 struct StatusPill: View {
     @ObservedObject var e = Engine.shared
     var body: some View {
-        let (label, color): (String, Color) = switch e.state {
-        case .countdown: ("Starting in \(e.countdownLeft)", .orange)
-        case .typing: ("Typing", .ink)
-        case .paused: (e.autoPaused ? "Paused · switched apps" : "Paused", .drop)
-        case .done: ("Done", .green)
-        case .idle: ("Ready", .secondary)
-        }
+        let (label, color) = status
         HStack(spacing: 6) {
             Circle().fill(color).frame(width: 7, height: 7)
                 .opacity(e.state == .typing ? 1 : 0.9)
@@ -471,6 +718,19 @@ struct StatusPill: View {
         }
         .padding(.horizontal, 10).padding(.vertical, 5)
         .background(Capsule().fill(color.opacity(0.12)))
+    }
+
+    var status: (String, Color) {
+        if e.mashing { return ("Mash mode · \(Int(e.progress * 100))%", .drop) }
+        if let end = e.breakUntil { return ("On break until \(end.formatted(date: .omitted, time: .shortened))", .orange) }
+        if let at = e.scheduledAt, !e.isActive { return ("Starts at \(at.formatted(date: .omitted, time: .shortened))", .orange) }
+        switch e.state {
+        case .countdown: return ("Starting in \(e.countdownLeft)", .orange)
+        case .typing: return ("Typing", .ink)
+        case .paused: return (e.autoPaused ? "Paused · switched apps" : "Paused", .drop)
+        case .done: return ("Done", .green)
+        case .idle: return ("Ready", .secondary)
+        }
     }
 }
 
@@ -487,7 +747,8 @@ struct MainView: View {
                     HeaderView()
                     EditorCard()
                     HStack(alignment: .top, spacing: 16) { PaceCard(); OutputCard() }
-                    if e.isActive || e.state == .done { ProgressCard() }
+                    WhereWhenCard()
+                    if e.isActive || e.mashing || e.state == .done { ProgressCard() }
                     ActionBar()
                 }
                 .padding(22)
@@ -567,9 +828,23 @@ struct PaceCard: View {
     @ObservedObject var e = Engine.shared
     var body: some View {
         Card(title: "Pace", symbol: "speedometer") {
-            Picker("", selection: e.$finishIn) { Text("Set speed").tag(false); Text("Finish in…").tag(true) }
+            Picker("", selection: e.$paceMode) { Text("Speed").tag("speed"); Text("Finish in…").tag("in"); Text("Done by…").tag("at") }
                 .pickerStyle(.segmented).labelsHidden()
-            if e.finishIn {
+            if e.finishAt {
+                HStack {
+                    Text("Done by")
+                    DatePicker("", selection: clockBinding(e.$finishAtMinutes), displayedComponents: .hourAndMinute).labelsHidden()
+                    Spacer()
+                }
+                let n = e.sourceText.count
+                let from = e.scheduledAt ?? Date()
+                let end = Typing.nextTime(minutes: e.finishAtMinutes, after: from)
+                let avail = Typing.workSeconds(e.activeBreaks, from: from, to: end)
+                Text(n == 0 ? "Add some text to see the speed"
+                     : "Ends \(end.formatted(date: .omitted, time: .shortened)) · \(Typing.clock(avail)) of typing\(e.activeBreaks.isEmpty ? "" : " after breaks") · ≈ \(Typing.speedLabel(Double(n) * e.rhythm.etaFactor / max(1, avail)))")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("It speeds up or slows down as it goes so it lands on time.").font(.caption).foregroundStyle(.secondary)
+            } else if e.finishIn {
                 HStack {
                     Slider(value: e.$finishMinutes, in: 0.25...60, step: 0.25)
                     Text(Typing.clock(e.finishMinutes * 60)).font(.system(.title3, design: .rounded).weight(.semibold)).monospacedDigit().frame(width: 76, alignment: .trailing)
@@ -629,17 +904,97 @@ struct OutputCard: View {
             Toggle("Trim trailing spaces", isOn: e.$cleanTrailing)
             Divider()
             HStack {
-                Text("Countdown").font(.subheadline.weight(.medium))
-                Spacer()
-                Stepper("\(e.countdown) s", value: e.$countdown, in: 0...15).monospacedDigit()
-            }
-            HStack {
                 Text("Key sound").font(.subheadline.weight(.medium))
                 Spacer()
                 Picker("", selection: e.$sound) { ForEach(["Off", "Tink", "Pop", "Morse", "Bottle", "Frog"], id: \.self) { Text($0) } }.labelsHidden().frame(width: 110)
             }
         }
         .frame(width: 330)
+    }
+}
+
+struct WhereWhenCard: View {
+    @ObservedObject var e = Engine.shared
+    var body: some View {
+        VStack(spacing: 16) {
+            Card(title: "Where", symbol: "macwindow.on.rectangle") {
+                HStack {
+                    Picker("Type into", selection: e.$target) {
+                        Text("The app in front").tag("front")
+                        Text("The app in front, then keep going in the background").tag("lock")
+                        Divider()
+                        ForEach(e.runningApps) { a in Text(a.name).tag(a.id) }
+                        if e.targetIsApp && !e.runningApps.contains(where: { $0.id == e.target }) { Text("\(e.targetAppName) (not open)").tag(e.target) }
+                    }
+                    Button { e.refreshApps() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh the list of open apps")
+                }
+                Text(e.target == "front"
+                     ? "Types into whatever is in front. Switching away pauses it."
+                     : e.target == "lock"
+                        ? "Starts in the app in front, then keeps typing there while you watch a video, switch apps or change Spaces."
+                        : "Types straight into \(e.targetAppName) in the background, no countdown. Put your cursor in the right spot there first, then go do anything else.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if e.target != "front" {
+                    Label("Use a different app for your video than the one being typed into.", systemImage: "info.circle").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            HStack(alignment: .top, spacing: 16) {
+            Card(title: "When", symbol: "clock") {
+                HStack {
+                    Text("Countdown")
+                    Spacer()
+                    Stepper("\(e.countdown) s", value: e.$countdown, in: 0...15).monospacedDigit()
+                }
+                Divider()
+                HStack {
+                    Text("Start at")
+                    DatePicker("", selection: $e.scheduleTime, displayedComponents: .hourAndMinute).labelsHidden()
+                    Spacer()
+                    if e.scheduledAt == nil {
+                        Button("Schedule") { e.schedule() }.disabled(e.sourceText.isEmpty)
+                    } else {
+                        Button("Cancel", role: .destructive) { e.cancelSchedule() }
+                    }
+                }
+                if let at = e.scheduledAt {
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        Label("Starts \(at.formatted(date: .omitted, time: .shortened)) · in \(Typing.clock(at.timeIntervalSinceNow))", systemImage: "alarm.fill")
+                            .font(.caption.monospacedDigit()).foregroundStyle(.orange)
+                    }
+                } else {
+                    Text("Your Mac stays awake until it's done.").font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
+                Text("Breaks").font(.subheadline.weight(.medium))
+                ForEach($e.breaks) { $b in
+                    HStack(spacing: 6) {
+                        Toggle("", isOn: $b.on).labelsHidden().toggleStyle(.checkbox)
+                        DatePicker("", selection: clockBinding($b.start), displayedComponents: .hourAndMinute).labelsHidden()
+                        Text("to").foregroundStyle(.secondary)
+                        DatePicker("", selection: clockBinding($b.end), displayedComponents: .hourAndMinute).labelsHidden()
+                    }
+                    .opacity(b.on ? 1 : 0.5)
+                }
+                Text("No typing during a break. It picks up where it stopped.").font(.caption).foregroundStyle(.secondary)
+            }
+            Card(title: "Mash mode", symbol: "wand.and.stars") {
+                Text("Smash any keys, anywhere. Your text comes out instead, exactly as written.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Stepper("\(e.mashPerKey) char\(e.mashPerKey == 1 ? "" : "s") per key", value: e.$mashPerKey, in: 1...8).monospacedDigit()
+                Button {
+                    e.toggleMash()
+                } label: {
+                    Label(e.mashing ? "Stop mashing" : "Start mash mode", systemImage: e.mashing ? "stop.fill" : "keyboard")
+                        .frame(maxWidth: .infinity)
+                }
+                .controlSize(.large)
+                .tint(e.mashing ? .drop : .ink)
+                .buttonStyle(.borderedProminent)
+                Text("⌃⌥⌘M toggles · esc stops · ⌫ steps back").font(.caption2).foregroundStyle(.secondary)
+            }
+            }
+        }
+        .onAppear { e.refreshApps() }
     }
 }
 
@@ -679,8 +1034,8 @@ struct ActionBar: View {
             .buttonStyle(InkButton(tint: e.state == .typing ? .drop : .ink))
             .keyboardShortcut(.return, modifiers: .command)
 
-            Button { e.stop() } label: { Label("Stop", systemImage: "stop.fill") }
-                .controlSize(.large).disabled(!e.isActive)
+            Button { e.mashing ? e.stopMash() : e.stop() } label: { Label("Stop", systemImage: "stop.fill") }
+                .controlSize(.large).disabled(!e.isActive && !e.mashing)
             Button { e.showTestRun = true } label: { Label("Try it here", systemImage: "eye") }
                 .controlSize(.large).disabled(e.isActive)
             Spacer()
@@ -691,9 +1046,11 @@ struct ActionBar: View {
             }.font(.caption).foregroundStyle(.secondary)
         }
         .padding(.top, 4)
-        Text(e.countdown > 0
-             ? "Press Start, then click into the app you want to type into. Typing begins after \(e.countdown) seconds."
-             : "Typing starts immediately in the app that's in front.")
+        Text(e.targetIsApp
+             ? "Press Start and it types into \(e.targetAppName) right away, even while you use other apps."
+             : e.countdown > 0
+                ? "Press Start, then click into the app you want to type into. Typing begins after \(e.countdown) seconds."
+                : "Typing starts immediately in the app that's in front.")
             .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -771,7 +1128,7 @@ struct TestRunSheet: View {
             ProgressView(value: e.progress).tint(.drop)
             HStack {
                 Button(e.state == .typing ? "Pause" : "Resume") { e.toggle() }.disabled(!(e.state == .typing || e.state == .paused))
-                Button("Restart") { scratch = ""; focused = true; e.start(hide: false, countdownOverride: 0) }
+                Button("Restart") { scratch = ""; focused = true; e.start(hide: false, countdownOverride: 0, tryIt: true) }
                 Spacer()
                 Button("Close") { e.stop(); e.showTestRun = false }.keyboardShortcut(.cancelAction)
             }
@@ -779,7 +1136,7 @@ struct TestRunSheet: View {
         .padding(22)
         .onAppear {
             focused = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.start(hide: false, countdownOverride: 0) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { e.start(hide: false, countdownOverride: 0, tryIt: true) }
         }
     }
 }
@@ -834,15 +1191,20 @@ struct HUDView: View {
             }
             .frame(width: 50, height: 50)
             VStack(alignment: .leading, spacing: 3) {
-                Text(e.state == .countdown ? "Click where you want to type…" : e.state == .paused ? (e.autoPaused ? "Paused · come back to resume" : "Paused") : e.state == .done ? "Done" : "Typing \(Int(e.progress * 100))%")
+                Text(e.mashing ? "Mash mode · \(Int(e.progress * 100))%"
+                     : e.breakUntil != nil ? "On break · \(Int(e.progress * 100))%"
+                     : e.state == .countdown ? "Click where you want to type…" : e.state == .paused ? (e.autoPaused ? "Paused · come back to resume" : "Paused") : e.state == .done ? "Done" : "Typing \(Int(e.progress * 100))%")
                     .font(.system(size: 13, weight: .semibold))
-                Text("\(Typing.speedLabel(e.cps)) · \(Typing.clock(e.etaSeconds)) left · esc to stop")
+                Text(e.mashing ? "Press any keys · esc to stop"
+                     : e.breakUntil != nil ? "Back at \(e.breakUntil!.formatted(date: .omitted, time: .shortened))"
+                     : Keys.targetPID != nil && !e.targetName.isEmpty ? "Into \(e.targetName) in the background · \(Typing.clock(e.etaSeconds)) left"
+                     : "\(Typing.speedLabel(e.cps)) · \(Typing.clock(e.etaSeconds)) left · esc to stop")
                     .font(.system(size: 11)).monospacedDigit().opacity(0.7)
             }
             Spacer(minLength: 0)
             VStack(spacing: 6) {
-                hudButton(e.state == .typing ? "pause.fill" : "play.fill") { e.toggle() }
-                hudButton("stop.fill") { e.stop() }
+                if !e.mashing { hudButton(e.state == .typing ? "pause.fill" : "play.fill") { e.toggle() } }
+                hudButton("stop.fill") { e.mashing ? e.stopMash() : e.stop() }
             }
         }
         .foregroundStyle(.white)
@@ -894,6 +1256,7 @@ struct SettingsView: View {
                 LabeledContent("Type clipboard at cursor", value: "⌃⌥⌘V")
                 LabeledContent("Stop", value: "⌃⌥⌘.  or  esc")
                 LabeledContent("Faster / slower", value: "⌃⌥⌘↑  ⌃⌥⌘↓")
+                LabeledContent("Mash mode on / off", value: "⌃⌥⌘M")
             }
             Section {
                 Button("Reset lifetime stats") { e.lifetimeChars = 0; e.lifetimeRuns = 0; e.lifetimeTypos = 0 }
@@ -917,6 +1280,8 @@ struct MenuView: View {
         Button(e.state == .typing ? "Pause" : e.state == .paused ? "Resume" : "Start typing") { e.toggle() }.keyboardShortcut("d", modifiers: [.control, .option, .command])
         Button("Type clipboard now") { e.start(fromClipboard: true) }.keyboardShortcut("v", modifiers: [.control, .option, .command])
         Button("Stop") { e.stop() }.disabled(!e.isActive)
+        Button(e.mashing ? "Stop mash mode" : "Mash mode") { e.toggleMash() }.keyboardShortcut("m", modifiers: [.control, .option, .command])
+        if let at = e.scheduledAt { Button("Cancel start at \(at.formatted(date: .omitted, time: .shortened))") { e.cancelSchedule() } }
         if !e.snippets.isEmpty {
             Divider()
             Menu("Type a snippet") {
@@ -937,7 +1302,8 @@ struct MenuBarLabel: View {
     @State private var opened = false
     var body: some View {
         Group {
-            if e.state == .typing { Text("\(Int(e.progress * 100))%") } else { Image(systemName: e.state == .paused ? "pause.circle" : "drop") }
+            if e.state == .typing || e.mashing { Text("\(Int(e.progress * 100))%") }
+            else { Image(systemName: e.scheduledAt != nil ? "alarm" : e.state == .paused ? "pause.circle" : "drop") }
         }
         .onAppear {
             guard !opened else { return }
@@ -1014,6 +1380,10 @@ enum CLI {
           --opt-enter     type new lines as Option+Return
           --no-indent     skip indentation after new lines (auto-indenting editors)
           --straighten    turn smart quotes and dashes into plain ones
+      -a, --app NAME      type into this app in the background (e.g. Notes, TextEdit)
+          --at TIME       wait until a time of day, e.g. 15:30 or 3:30pm
+      -u, --until TIME    be done by a time of day; the pace adjusts as it goes
+      -b, --break A-B     no typing between two times, e.g. 12:00-12:30 (up to 3)
           --dry           print what would be typed and how long it takes, type nothing
       -q, --quiet         no progress bar
       -h, --help          show this help
@@ -1027,6 +1397,8 @@ enum CLI {
         var text: String?
         var cps = 5.0, rhythm = Rhythm.human, typos = 0.0, delay = 3.0, newline = NewlineMode.ret
         var noIndent = false, straighten = false, dry = false, quiet = false, finishSecs: Double?
+        var appName: String?, startAt: Date?, until: Date?
+        var breaks: [(Int, Int)] = []
         var words: [String] = []
 
         func value(_ flag: String) -> String? {
@@ -1057,6 +1429,23 @@ enum CLI {
             case "--no-indent": noIndent = true
             case "--straighten": straighten = true
             case "--dry": dry = true
+            case "-a", "--app": appName = value(a)
+            case "-u", "--until":
+                let v = value(a)!
+                guard let d = parseClock(v) else { err(c("31", "Can't read the time \(v). Try 17:00 or 5pm.")); return 2 }
+                until = d
+            case "-b", "--break":
+                let v = value(a)!, parts = v.split(separator: "-").map(String.init)
+                guard breaks.count < 3, parts.count == 2, let s = parseClock(parts[0]), let e = parseClock(parts[1]) else {
+                    err(c("31", "Breaks look like 12:00-12:30, and you can have up to 3.")); return 2
+                }
+                let cal = Calendar.current
+                func mins(_ d: Date) -> Int { cal.component(.hour, from: d) * 60 + cal.component(.minute, from: d) }
+                breaks.append((mins(s), mins(e)))
+            case "--at":
+                let v = value(a)!
+                guard let d = parseClock(v) else { err(c("31", "Can't read the time \(v). Try 15:30 or 3:30pm.")); return 2 }
+                startAt = d
             case "-q", "--quiet": quiet = true
             default:
                 if a.hasPrefix("-") && a.count > 1 { err(c("31", "Unknown option \(a)") + "\nRun dripwriter --help"); return 2 }
@@ -1070,6 +1459,12 @@ enum CLI {
         let chars = Array(t)
         if let f = finishSecs { cps = Double(chars.count) * rhythm.etaFactor / max(1, f) }
         cps = max(0.2, min(cps, 600))
+        if let u = until {
+            let from = startAt ?? Date()
+            let deadline = u > from ? u : Typing.nextTime(minutes: Calendar.current.component(.hour, from: u) * 60 + Calendar.current.component(.minute, from: u), after: from)
+            until = deadline
+            cps = Double(chars.count) * rhythm.etaFactor / max(1, Typing.workSeconds(breaks, from: from, to: deadline))
+        }
         let eta = Double(chars.count) / cps * rhythm.etaFactor
 
         if dry {
@@ -1085,7 +1480,28 @@ enum CLI {
             return 1
         }
 
-        if !quiet { err(c("1;34", "▸ ") + "Typing \(chars.count) keys at \(Typing.speedLabel(cps)), about \(Typing.clock(eta)). Click into the target app.") }
+        if let name = appName {
+            let n = name.lowercased()
+            guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.localizedName?.lowercased() == n || $0.bundleIdentifier?.lowercased() == n }) else {
+                err(c("31", "\(name) isn't open.") + " Open it and put your cursor where the text should go."); return 1
+            }
+            Keys.targetPID = app.processIdentifier
+            delay = 0
+        }
+        if let at = startAt {
+            if !quiet { err(c("1;34", "▸ ") + "Waiting until \(at.formatted(date: .omitted, time: .shortened)). Ctrl-C to cancel.") }
+            let activity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled], reason: "dripwriter --at")
+            while Date() < at {
+                if !quiet { FileHandle.standardError.write("\r  starts in \(Typing.clock(at.timeIntervalSinceNow)) ".data(using: .utf8)!) }
+                Thread.sleep(forTimeInterval: min(1, max(0.05, at.timeIntervalSinceNow)))
+            }
+            ProcessInfo.processInfo.endActivity(activity)
+            if !quiet { err("") }
+        }
+        if !quiet {
+            let whereTo = appName.map { "into \($0) in the background" } ?? "Click into the target app."
+            err(c("1;34", "▸ ") + "Typing \(chars.count) keys at \(Typing.speedLabel(cps)), about \(Typing.clock(eta)). \(whereTo)")
+        }
         var left = delay
         while left > 0 {
             if !quiet { FileHandle.standardError.write("\r  starting in \(Int(left.rounded(.up)))… ".data(using: .utf8)!) }
@@ -1098,6 +1514,13 @@ enum CLI {
         let start = Date()
         var atLineStart = false, fixed = 0, lastDraw = Date.distantPast
         for (i, ch) in chars.enumerated() {
+            if let end = Typing.breakEnd(breaks) {
+                if !quiet { FileHandle.standardError.write("\r  ☕ on break until \(end.formatted(date: .omitted, time: .shortened))      ".data(using: .utf8)!) }
+                Thread.sleep(forTimeInterval: max(0.5, end.timeIntervalSinceNow))
+            }
+            if let d = until, i % 10 == 0 {
+                cps = min(600, max(0.02, Double(chars.count - i) * rhythm.etaFactor / max(1, Typing.workSeconds(breaks, from: Date(), to: d))))
+            }
             if noIndent && atLineStart && (ch == " " || ch == "\t") { continue }
             atLineStart = ch == "\n"
             if Keys.emit(ch, newline: newline, typoPct: typos, wait: { Thread.sleep(forTimeInterval: $0) }, base: 1 / cps) { fixed += 1 }
@@ -1114,6 +1537,19 @@ enum CLI {
             err("\n" + c("32", "✓ ") + "Typed \(chars.count) keys in \(Typing.clock(Date().timeIntervalSince(start)))" + (fixed > 0 ? ", fixed \(fixed) typos" : "") + ".")
         }
         return 0
+    }
+
+    static func parseClock(_ s: String) -> Date? {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX")
+        let t = s.lowercased().replacingOccurrences(of: " ", with: "")
+        for fmt in ["H:mm", "h:mma", "ha", "H"] {
+            f.dateFormat = fmt
+            if let d = f.date(from: t) {
+                let hm = Calendar.current.dateComponents([.hour, .minute], from: d)
+                return Calendar.current.nextDate(after: Date(), matching: hm, matchingPolicy: .nextTime)
+            }
+        }
+        return nil
     }
 
     static func parseDuration(_ s: String) -> Double {

@@ -26,12 +26,18 @@ No Mac? Use the [web version](https://learningnihongo934-byte.github.io/dripwrit
 |---|---|
 | `⌃⌥⌘V` | Type the clipboard wherever your cursor is |
 | `⌃⌥⌘D` | Start / pause the text in the DripWriter window |
+| `⌃⌥⌘M` | Mash mode: any keys you press type your text |
 | `⌃⌥⌘↑` `⌃⌥⌘↓` | Faster / slower, even mid-run |
 | `esc` or `⌃⌥⌘.` | Stop |
 
 ## Features
 
 - **Types anywhere.** Notes, Google Docs, Word, Slack, Discord, VS Code, browsers, terminals.
+- **Types in the background.** Pick an app and it keeps typing there while you watch a video, switch apps or change Spaces.
+- **Mash mode.** Smash any keys, anywhere, and your text comes out instead, exactly as written. `⌃⌥⌘M`.
+- **Start at a time.** Schedule it for 3:00 PM; your Mac stays awake until it's done.
+- **Done by a time.** Set an end time and it paces itself to land on it, speeding up or slowing down as it goes.
+- **Breaks.** Up to three break windows where nothing gets typed; it picks up where it stopped.
 - **Pace your way.** 12 wpm up to 400 keys a second, or tell it to **finish in** 5 minutes and it works out the speed.
 - **Five rhythms.** Human (pauses after sentences), Steady, Nervous, Burst and Drip.
 - **Realistic typos.** Hits a neighboring key, pauses, backspaces, fixes it.
@@ -51,6 +57,8 @@ dripwriter "hello world"                 # type text into the front app
 dripwriter -f essay.txt -w 90 -T 2       # a file at 90 wpm with 2% typos
 pbpaste | dripwriter -t 5m               # the clipboard, finishing in 5 minutes
 dripwriter -r burst --shift-enter -f msg.txt
+dripwriter -f essay.txt -a Notes         # type into Notes in the background
+dripwriter -f essay.txt --at 9am -u 5pm -b 12:00-13:00   # 9 to 5 with a lunch break
 dripwriter --dry -f essay.txt            # how long would it take?
 dripwriter --help
 ```
