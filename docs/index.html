@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DripWriter</title>
+<meta name="description" content="A macOS app and terminal command that types your text into any app, one keystroke at a time.">
+<link rel="icon" href="icon.png">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,700;12..96,800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{--bg:#f4f6fb;--fg:#141b2b;--muted:#5b6880;--line:#d6dcea;--ink:#2f4fd6;--drop:#e8344a;--card:#fff;--code:#0f1530;--code-fg:#e3e9f2;
+  --f-ui:"Bricolage Grotesque",ui-sans-serif,system-ui,sans-serif;--f-mono:"JetBrains Mono",ui-monospace,Menlo,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#0d121c;--fg:#e3e9f2;--muted:#8d9ab0;--line:#253047;--ink:#7d95ff;--drop:#ff5d70;--card:#151c2a;--code:#070b16;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 var(--f-ui)}
+.wrap{max-width:880px;margin:0 auto;padding:56px max(20px,env(safe-area-inset-left))}
+.hero{display:flex;gap:28px;align-items:center;flex-wrap:wrap}
+.hero img{width:132px;height:132px;filter:drop-shadow(0 12px 24px rgba(30,45,140,.3))}
+h1{font-size:clamp(44px,8vw,72px);line-height:1;margin:0;letter-spacing:-.04em;font-weight:800}
+h1 span{color:var(--drop)}
+.lede{font-size:20px;color:var(--muted);margin:10px 0 0;max-width:34ch}
+.install{margin-top:40px;background:var(--code);color:var(--code-fg);border-radius:14px;padding:18px 20px;display:flex;gap:12px;align-items:center}
+.install code{font:14px var(--f-mono);overflow-x:auto;white-space:nowrap;flex:1;min-width:0}
+.install code::before{content:"$ ";color:#ff5d70}
+button{font:600 14px var(--f-ui);border:0;border-radius:9px;padding:9px 14px;background:var(--ink);color:#fff;cursor:pointer}
+.sub{color:var(--muted);font-size:14px;margin-top:10px}
+.sub a{color:var(--ink)}
+.typed{margin-top:44px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;font:17px/1.7 var(--f-mono);min-height:120px;white-space:pre-wrap}
+.typed .c{display:inline-block;width:2px;height:1.1em;background:var(--drop);vertical-align:-3px;animation:b 1s steps(1) infinite}
+@keyframes b{50%{opacity:0}}
+h2{font-size:28px;letter-spacing:-.02em;margin:56px 0 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+.f{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.f b{display:block;margin-bottom:2px}
+.f span{color:var(--muted);font-size:15px}
+pre{background:var(--code);color:var(--code-fg);border-radius:14px;padding:18px 20px;font:13.5px/1.7 var(--f-mono);overflow-x:auto}
+pre i{color:#7f8db0;font-style:normal}
+kbd{font:12px var(--f-mono);border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:1px 6px;background:var(--card)}
+table{border-collapse:collapse;width:100%}td{padding:8px 0;border-bottom:1px solid var(--line)}td:first-child{width:170px}
+footer{margin-top:64px;color:var(--muted);font-size:14px}
+footer a{color:inherit}
+@media (prefers-reduced-motion:reduce){.typed .c{animation:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <img src="icon.png" alt="DripWriter app icon">
+    <div>
+      <h1>Drip<span>Writer</span></h1>
+      <p class="lede">Types your text into any app, one keystroke at a time, exactly as written.</p>
+    </div>
+  </div>
+
+  <div class="install">
+    <code id="cmd">curl -fsSL https://raw.githubusercontent.com/learningnihongo934-byte/dripwriter/main/install.sh | bash</code>
+    <button id="copy">Copy</button>
+  </div>
+  <p class="sub">Paste into Terminal on macOS 14 or newer. Installs the app and the <code>dripwriter</code> command. No Mac? <a href="app/">Try the web version</a>.</p>
+
+  <div class="typed" id="demo" aria-label="Typing demo"></div>
+
+  <h2>What it does</h2>
+  <div class="grid">
+    <div class="f"><b>Types anywhere</b><span>Docs, Notes, Slack, Discord, VS Code, browsers, terminals.</span></div>
+    <div class="f"><b>Finish in…</b><span>Pick a speed, or a deadline and let it work out the pace.</span></div>
+    <div class="f"><b>Five rhythms</b><span>Human, Steady, Nervous, Burst and Drip.</span></div>
+    <div class="f"><b>Real typos</b><span>Hits a neighboring key, backspaces, fixes it.</span></div>
+    <div class="f"><b>Floating panel</b><span>Progress, pause and stop over any app.</span></div>
+    <div class="f"><b>Safe stops</b><span>Esc stops. Switching apps pauses; coming back resumes.</span></div>
+    <div class="f"><b>Chat and code ready</b><span>Shift+Return new lines, skip auto-indent.</span></div>
+    <div class="f"><b>Library</b><span>Snippets, history, drag-in files, lifetime stats.</span></div>
+  </div>
+
+  <h2>Shortcuts</h2>
+  <table>
+    <tr><td><kbd>⌃⌥⌘V</kbd></td><td>Type the clipboard at your cursor</td></tr>
+    <tr><td><kbd>⌃⌥⌘D</kbd></td><td>Start or pause</td></tr>
+    <tr><td><kbd>⌃⌥⌘↑</kbd> <kbd>⌃⌥⌘↓</kbd></td><td>Faster or slower while typing</td></tr>
+    <tr><td><kbd>esc</kbd></td><td>Stop</td></tr>
+  </table>
+
+  <h2>From the terminal</h2>
+<pre>dripwriter "hello world"            <i># type into the front app</i>
+dripwriter -f essay.txt -w 90 -T 2  <i># 90 wpm, 2% typos</i>
+pbpaste | dripwriter -t 5m          <i># finish in five minutes</i>
+dripwriter --dry -f essay.txt       <i># how long would it take?</i></pre>
+
+  <footer>Made by Virat Reddy Kaukuntla · <a href="https://github.com/learningnihongo934-byte/dripwriter">Source on GitHub</a> · <a href="https://rennko.tech">rennko.tech</a></footer>
+</div>
+<script>
+document.getElementById('copy').onclick=e=>{navigator.clipboard.writeText(document.getElementById('cmd').textContent).then(()=>{e.target.textContent='Copied';setTimeout(()=>e.target.textContent='Copy',1500)})};
+const lines="Dear team,\n\n    This paragraph was never pasted.\nIt was typed, key by key, by DripWriter.";
+const el=document.getElementById('demo');let i=0;
+function tick(){if(i>lines.length){setTimeout(()=>{i=0;tick()},2600);return}
+  el.textContent=lines.slice(0,i);const c=document.createElement('span');c.className='c';el.appendChild(c);
+  const ch=lines[i-1]||'';i++;setTimeout(tick,ch==='.'||ch===','?380:ch==='\n'?260:40+Math.random()*70)}
+if(matchMedia('(prefers-reduced-motion: reduce)').matches){el.textContent=lines}else tick();
+</script>
+</body>
+</html>
