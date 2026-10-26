@@ -37,6 +37,7 @@ No Mac? Use the [web version](https://learningnihongo934-byte.github.io/dripwrit
 - **Mash mode.** Smash any keys, anywhere, and your text comes out instead, exactly as written. `⌃⌥⌘M`.
 - **Start at a time.** Schedule it for 3:00 PM; your Mac stays awake until it's done.
 - **Done by a time.** Set an end time and it paces itself to land on it, speeding up or slowing down as it goes.
+- **Repeat mode.** Retype the same text 2 to 9,999 times, or forever. Put a new line, a blank line, a space or nothing between rounds, and add a pause if you like. With "Finish in" or "Done by", forever means it keeps going until that time. It works in Mash mode too.
 - **Breaks.** Up to three break windows where nothing gets typed; it picks up where it stopped.
 - **Pace your way.** 12 wpm up to 400 keys a second, or tell it to **finish in** 5 minutes and it works out the speed.
 - **Five rhythms.** Human (pauses after sentences), Steady, Nervous, Burst and Drip.
@@ -59,6 +60,8 @@ pbpaste | dripwriter -t 5m               # the clipboard, finishing in 5 minutes
 dripwriter -r burst --shift-enter -f msg.txt
 dripwriter -f essay.txt -a Notes         # type into Notes in the background
 dripwriter -f essay.txt --at 9am -u 5pm -b 12:00-13:00   # 9 to 5 with a lunch break
+dripwriter -R 10 --sep blank "Line"      # type it 10 times, blank line between
+dripwriter -R 0 -t 30m -f chant.txt      # keep retyping it for 30 minutes
 dripwriter --dry -f essay.txt            # how long would it take?
 dripwriter --help
 ```

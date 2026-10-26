@@ -6,7 +6,7 @@ import Carbon.HIToolbox
 import ApplicationServices
 import ServiceManagement
 
-let appVersion = "2.1.1"
+let appVersion = "2.2.0"
 
 // MARK: - Typing model (shared by the app and the CLI)
 
@@ -101,6 +101,9 @@ enum Typing {
     static func nextTime(minutes m: Int, after d: Date) -> Date {
         Calendar.current.nextDate(after: d, matching: DateComponents(hour: m / 60, minute: m % 60), matchingPolicy: .nextTime) ?? d
     }
+
+    /// What gets typed between rounds in repeat mode.
+    static func separator(_ name: String) -> String { ["newline": "\n", "blank": "\n\n", "space": " ", "none": ""][name] ?? "\n" }
 
     static func speedLabel(_ cps: Double) -> String { cps < 20 ? "\(Int((cps * 12).rounded())) wpm" : "\(Int(cps)) keys/s" }
     static func clock(_ s: Double) -> String {
@@ -226,6 +229,11 @@ final class Engine: ObservableObject {
     @AppStorage("lifetimeTypos") var lifetimeTypos = 0
     @AppStorage("target") var target = "front"      // "front", "lock", or an app's bundle id
     @AppStorage("mashPerKey") var mashPerKey = 1
+    @AppStorage("repeatOn") var repeatOn = false
+    @AppStorage("repeatCount") var repeatCount = 3
+    @AppStorage("repeatForever") var repeatForever = false
+    @AppStorage("repeatSep") var repeatSep = "newline"
+    @AppStorage("repeatGap") var repeatGap = 1.0
 
     @Published var state: RunState = .idle
     @Published var pos = 0
@@ -244,6 +252,9 @@ final class Engine: ObservableObject {
     @Published var breaks: [BreakWindow] = [] { didSet { save("breaks", breaks) } }
     @Published var breakUntil: Date?
     @Published var deadline: Date?
+    @Published var round = 1
+    @Published var roundsTotal: Int? = 1             // nil = forever
+    @Published var stopAt: Date?                     // repeat-forever with a time limit
     private var scheduleTask: Task<Void, Never>?
     private var awake: NSObjectProtocol?
 
@@ -269,8 +280,34 @@ final class Engine: ObservableObject {
     var sliderCPS: Double { (exp(log(400.0) * speed) * 10).rounded() / 10 }
     var cps: Double { paceOverride ?? sliderCPS }
     var speedLabel: String { finishIn && state == .idle ? "in \(Typing.clock(finishMinutes * 60))" : Typing.speedLabel(cps) }
-    var progress: Double { total == 0 ? 0 : Double(pos) / Double(total) }
-    var etaSeconds: Double { deadline.map { max(0, $0.timeIntervalSinceNow) } ?? Double(total - pos) / cps * rhythm.etaFactor }
+    var rounds: Int? { repeatOn ? (repeatForever ? nil : max(2, repeatCount)) : 1 }
+    var progress: Double {
+        guard total > 0 else { return 0 }
+        if let r = roundsTotal, r > 1 { return min(1, Double((round - 1) * total + pos) / Double(r * total)) }
+        return Double(pos) / Double(total)
+    }
+    var etaSeconds: Double {
+        if let s = stopAt { return max(0, s.timeIntervalSinceNow) }
+        if let d = deadline { return max(0, d.timeIntervalSinceNow) }
+        let roundsLeft = max(0, (roundsTotal ?? round) - round)
+        return Double(total - pos + roundsLeft * total) / cps * rhythm.etaFactor + Double(roundsLeft) * repeatGap
+    }
+    var roundLabel: String? {
+        guard repeatOn || roundsTotal != 1 else { return nil }
+        return roundsTotal.map { "round \(round) of \($0)" } ?? "round \(round)"
+    }
+    var repeatSummary: String {
+        guard repeatOn else { return "Types the text once." }
+        let between = ["newline": "a new line", "blank": "a blank line", "space": "a space", "none": "nothing"][repeatSep] ?? "a new line"
+        let gap = repeatGap > 0 ? ", pausing \(Typing.clock(repeatGap)) between rounds" : ""
+        if repeatForever {
+            let until = finishAt ? "until \(Typing.nextTime(minutes: finishAtMinutes, after: Date()).formatted(date: .omitted, time: .shortened))"
+                : finishIn ? "for \(Typing.clock(finishMinutes * 60))" : "until you press Stop or esc"
+            return "Keeps retyping it \(until), with \(between) between rounds\(gap)."
+        }
+        let paced = finishIn || finishAt ? " The speed is set so all \(max(2, repeatCount)) rounds finish on time." : ""
+        return "Types it \(max(2, repeatCount)) times with \(between) between rounds\(gap).\(paced)"
+    }
     var isActive: Bool { state == .typing || state == .paused || state == .countdown }
     var finishIn: Bool { paceMode == "in" }
     var finishAt: Bool { paceMode == "at" }
@@ -308,7 +345,10 @@ final class Engine: ObservableObject {
         guard !source.isEmpty else { NSSound.beep(); return }
         task?.cancel()
         chars = Array(source); pos = 0; total = chars.count; typosFixed = 0; autoPaused = false
-        paceOverride = finishIn ? Double(total) * rhythm.etaFactor / max(5, finishMinutes * 60) : nil
+        round = 1; roundsTotal = rounds; stopAt = nil
+        let allKeys = roundsTotal.map { Double(total * $0 + Typing.separator(repeatSep).count * ($0 - 1)) }
+        let gaps = repeatGap * Double(max(0, (roundsTotal ?? 1) - 1))   // pauses between rounds come out of the time
+        paceOverride = finishIn ? allKeys.map { $0 * rhythm.etaFactor / max(5, finishMinutes * 60 - gaps) } : nil
         hideWhenStarting = hide
         remember(source)
         keepAwake(true)
@@ -357,11 +397,19 @@ final class Engine: ObservableObject {
         // in background modes every key goes straight to the target, wherever you are
         Keys.targetPID = mode == "front" ? nil : targetPID
         deadline = finishAt ? Typing.nextTime(minutes: finishAtMinutes, after: Date()) : nil
+        if roundsTotal == nil && (finishIn || finishAt) {
+            // repeating forever with a time limit: keep the slider speed and stop when time's up
+            stopAt = deadline ?? Date().addingTimeInterval(finishMinutes * 60)
+            deadline = nil; paceOverride = nil
+        }
+        let sep = Array(Typing.separator(repeatSep))
         state = .typing
         lifetimeRuns += 1
         var atLineStart = false
+        roundLoop: while true {
         while pos < chars.count {
             if Task.isCancelled { return }
+            if let s = stopAt, Date() >= s { break roundLoop }
             if state == .paused { try? await Task.sleep(nanoseconds: 50_000_000); continue }
             if let end = Typing.breakEnd(activeBreaks) {
                 breakUntil = end
@@ -372,7 +420,9 @@ final class Engine: ObservableObject {
             // aim for the finish time: re-pace from what's left, minus any breaks still to come
             if let d = deadline, pos % 10 == 0 {
                 let avail = Typing.workSeconds(activeBreaks, from: Date(), to: d)
-                paceOverride = min(400, max(0.02, Double(chars.count - pos) * rhythm.etaFactor / max(1, avail)))
+                let roundsLeft = roundsTotal.map { max(0, $0 - round) } ?? 0
+                let later = roundsLeft * (chars.count + sep.count)
+                paceOverride = min(400, max(0.02, Double(chars.count - pos + later) * rhythm.etaFactor / max(1, avail - Double(roundsLeft) * repeatGap)))
             }
             let ch = chars[pos]
 
@@ -397,9 +447,28 @@ final class Engine: ObservableObject {
             lifetimeChars += 1
             await sleep(Typing.delay(after: ch, pos: pos, cps: cps, rhythm: rhythm))
         }
+            // repeat mode: separator, a pause, then the same text again
+            if let r = roundsTotal, round >= r { break }
+            if let s = stopAt, Date() >= s { break }
+            for ch in sep {
+                if Task.isCancelled { return }
+                _ = Keys.emit(ch, newline: newline, typoPct: 0, wait: { _ in }, base: 1 / cps)
+                click(ch)
+                await sleep(Typing.delay(after: ch, pos: pos, cps: cps, rhythm: rhythm))
+            }
+            atLineStart = sep.last == "\n"
+            var waited = 0.0
+            while waited < repeatGap || state == .paused {
+                if Task.isCancelled { return }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if state != .paused { waited += 0.1 }
+            }
+            round += 1; pos = 0
+        }
         state = .done
         paceOverride = nil
         deadline = nil
+        stopAt = nil
         Keys.targetPID = nil
         keepAwake(scheduledAt != nil)
         if sound != "Off" || bell { NSSound(named: "Glass")?.play() }
@@ -456,6 +525,7 @@ final class Engine: ObservableObject {
         guard !source.isEmpty else { NSSound.beep(); return }
         guard Mash.install() else { Accessibility.explainMashBlocked(); return }
         chars = Array(source); pos = 0; total = chars.count; typosFixed = 0
+        round = 1; roundsTotal = rounds; stopAt = nil
         Keys.targetPID = nil
         mashing = true
         state = .idle
@@ -488,6 +558,12 @@ final class Engine: ObservableObject {
             click(ch)
         }
         if pos >= chars.count {
+            if roundsTotal.map({ round < $0 }) ?? true {
+                // repeat mode: the separator comes out, and the next key starts the text again
+                for ch in Typing.separator(repeatSep) { _ = Keys.emit(ch, newline: newline, typoPct: 0, wait: { _ in }, base: 0) }
+                round += 1; pos = 0
+                return true
+            }
             state = .done
             NSSound(named: "Glass")?.play()
             stopMash()
@@ -768,7 +844,7 @@ struct StatusPill: View {
         if let at = e.scheduledAt, !e.isActive { return ("Starts at \(at.formatted(date: .omitted, time: .shortened))", .orange) }
         switch e.state {
         case .countdown: return ("Starting in \(e.countdownLeft)", .orange)
-        case .typing: return ("Typing", .ink)
+        case .typing: return (e.roundLabel.map { "Typing · \($0)" } ?? "Typing", .ink)
         case .paused: return (e.autoPaused ? "Paused · switched apps" : "Paused", .drop)
         case .done: return ("Done", .green)
         case .idle: return ("Ready", .secondary)
@@ -1035,6 +1111,28 @@ struct WhereWhenCard: View {
                 Text("⌃⌥⌘M toggles · esc stops · ⌫ steps back").font(.caption2).foregroundStyle(.secondary)
             }
             }
+            Card(title: "Repeat", symbol: "repeat") {
+                HStack(spacing: 16) {
+                    Toggle("Retype it over and over", isOn: e.$repeatOn).toggleStyle(.switch)
+                    if e.repeatOn {
+                        Toggle("Forever", isOn: e.$repeatForever)
+                        Stepper("\(max(2, e.repeatCount)) times", value: e.$repeatCount, in: 2...9999).monospacedDigit().disabled(e.repeatForever)
+                    }
+                    Spacer()
+                }
+                if e.repeatOn {
+                    HStack(spacing: 12) {
+                        Text("Between rounds")
+                        Picker("", selection: e.$repeatSep) {
+                            Text("New line").tag("newline"); Text("Blank line").tag("blank"); Text("Space").tag("space"); Text("Nothing").tag("none")
+                        }
+                        .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 320)
+                        Spacer()
+                        Stepper(e.repeatGap == 0 ? "No pause" : "\(Typing.clock(e.repeatGap)) pause", value: e.$repeatGap, in: 0...3600, step: e.repeatGap < 10 ? 1 : 5).monospacedDigit()
+                    }
+                }
+                Text(e.repeatSummary).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
         }
         .onAppear { e.refreshApps() }
     }
@@ -1051,6 +1149,7 @@ struct ProgressCard: View {
                 stat(Typing.clock(e.etaSeconds), "left")
                 stat(Typing.speedLabel(e.cps), "speed")
                 stat("\(e.typosFixed)", "typos fixed")
+                if e.roundLabel != nil { stat(e.roundsTotal.map { "\(e.round)/\($0)" } ?? "\(e.round) / ∞", "round") }
                 Spacer()
             }
         }
@@ -1235,7 +1334,7 @@ struct HUDView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(e.mashing ? "Mash mode · \(Int(e.progress * 100))%"
                      : e.breakUntil != nil ? "On break · \(Int(e.progress * 100))%"
-                     : e.state == .countdown ? "Click where you want to type…" : e.state == .paused ? (e.autoPaused ? "Paused · come back to resume" : "Paused") : e.state == .done ? "Done" : "Typing \(Int(e.progress * 100))%")
+                     : e.state == .countdown ? "Click where you want to type…" : e.state == .paused ? (e.autoPaused ? "Paused · come back to resume" : "Paused") : e.state == .done ? "Done" : "Typing \(Int(e.progress * 100))%" + (e.roundLabel.map { " · \($0)" } ?? ""))
                     .font(.system(size: 13, weight: .semibold))
                 Text(e.mashing ? "Press any keys · esc to stop"
                      : e.breakUntil != nil ? "Back at \(e.breakUntil!.formatted(date: .omitted, time: .shortened))"
@@ -1426,6 +1525,9 @@ enum CLI {
           --at TIME       wait until a time of day, e.g. 15:30 or 3:30pm
       -u, --until TIME    be done by a time of day; the pace adjusts as it goes
       -b, --break A-B     no typing between two times, e.g. 12:00-12:30 (up to 3)
+      -R, --repeat N      type it N times; 0 = forever (with -t or -u: keep going until then)
+          --sep KIND      between repeats: newline (default), blank, space or none
+          --gap SEC       pause between repeats (default 1)
           --dry           print what would be typed and how long it takes, type nothing
       -q, --quiet         no progress bar
       -h, --help          show this help
@@ -1441,6 +1543,7 @@ enum CLI {
         var noIndent = false, straighten = false, dry = false, quiet = false, finishSecs: Double?
         var appName: String?, startAt: Date?, until: Date?
         var breaks: [(Int, Int)] = []
+        var repeatN = 1, sepName = "newline", gap = 1.0
         var words: [String] = []
 
         func value(_ flag: String) -> String? {
@@ -1472,6 +1575,11 @@ enum CLI {
             case "--straighten": straighten = true
             case "--dry": dry = true
             case "-a", "--app": appName = value(a)
+            case "-R", "--repeat": repeatN = max(0, Int(value(a)!) ?? 1)
+            case "--sep":
+                sepName = value(a)!.lowercased()
+                guard ["newline", "blank", "space", "none"].contains(sepName) else { err(c("31", "--sep is newline, blank, space or none.")); return 2 }
+            case "--gap": gap = max(0, Double(value(a)!) ?? 1)
             case "-u", "--until":
                 let v = value(a)!
                 guard let d = parseClock(v) else { err(c("31", "Can't read the time \(v). Try 17:00 or 5pm.")); return 2 }
@@ -1499,19 +1607,27 @@ enum CLI {
         guard var t = text, !t.isEmpty else { print(help); return 1 }
         t = Typing.clean(t, quotes: straighten, tabs: false, trailing: false)
         let chars = Array(t)
-        if let f = finishSecs { cps = Double(chars.count) * rhythm.etaFactor / max(1, f) }
+        let sepChars = Array(Typing.separator(sepName))
+        // every key across all repeats; forever has no total, so -t/-u become "stop then" instead of setting the pace
+        let totalKeys = chars.count * max(1, repeatN) + sepChars.count * max(0, repeatN - 1)
+        var stopAt: Date?
+        if repeatN == 0, let f = finishSecs { stopAt = Date().addingTimeInterval(f + delay); finishSecs = nil }
+        let gaps = gap * Double(max(0, repeatN - 1))     // the pauses between rounds come out of the time too
+        if let f = finishSecs { cps = Double(totalKeys) * rhythm.etaFactor / max(1, f - gaps) }
         cps = max(0.2, min(cps, 600))
+        if repeatN == 0, let u = until { stopAt = u; until = nil }
         if let u = until {
             let from = startAt ?? Date()
             let deadline = u > from ? u : Typing.nextTime(minutes: Calendar.current.component(.hour, from: u) * 60 + Calendar.current.component(.minute, from: u), after: from)
             until = deadline
-            cps = Double(chars.count) * rhythm.etaFactor / max(1, Typing.workSeconds(breaks, from: from, to: deadline))
+            cps = Double(totalKeys) * rhythm.etaFactor / max(1, Typing.workSeconds(breaks, from: from, to: deadline) - gaps)
         }
-        let eta = Double(chars.count) / cps * rhythm.etaFactor
+        let eta = stopAt.map { $0.timeIntervalSinceNow } ?? Double(totalKeys) / cps * rhythm.etaFactor + Double(max(0, repeatN - 1)) * gap
 
         if dry {
-            print(t)
-            err(c("2", "\(chars.count) keys · \(Typing.speedLabel(cps)) · \(rhythm.rawValue.lowercased()) · about \(Typing.clock(eta))"))
+            let sepStr = String(sepChars)
+            print(repeatN > 1 ? Array(repeating: t, count: repeatN).joined(separator: sepStr) : t, terminator: repeatN == 0 ? "\(sepStr)…\n" : "\n")
+            err(c("2", (repeatN == 1 ? "" : repeatN == 0 ? "repeats forever · " : "\(repeatN) rounds · ") + "\(totalKeys) keys · \(Typing.speedLabel(cps)) · \(rhythm.rawValue.lowercased()) · about \(Typing.clock(eta))"))
             return 0
         }
         if !AXIsProcessTrusted() {
@@ -1554,29 +1670,45 @@ enum CLI {
         }
 
         let start = Date()
-        var atLineStart = false, fixed = 0, lastDraw = Date.distantPast
-        for (i, ch) in chars.enumerated() {
-            if let end = Typing.breakEnd(breaks) {
-                if !quiet { FileHandle.standardError.write("\r  ☕ on break until \(end.formatted(date: .omitted, time: .shortened))      ".data(using: .utf8)!) }
-                Thread.sleep(forTimeInterval: max(0.5, end.timeIntervalSinceNow))
+        var atLineStart = false, fixed = 0, lastDraw = Date.distantPast, typed = 0, round = 1
+        rounds: while true {
+            for (i, ch) in chars.enumerated() {
+                if let s = stopAt, Date() >= s { break rounds }
+                if let end = Typing.breakEnd(breaks) {
+                    if !quiet { FileHandle.standardError.write("\r  ☕ on break until \(end.formatted(date: .omitted, time: .shortened))      ".data(using: .utf8)!) }
+                    Thread.sleep(forTimeInterval: max(0.5, end.timeIntervalSinceNow))
+                }
+                if let d = until, i % 10 == 0 {
+                    cps = min(600, max(0.02, Double(totalKeys - typed) * rhythm.etaFactor / max(1, Typing.workSeconds(breaks, from: Date(), to: d))))
+                }
+                if noIndent && atLineStart && (ch == " " || ch == "\t") { typed += 1; continue }
+                atLineStart = ch == "\n"
+                if Keys.emit(ch, newline: newline, typoPct: typos, wait: { Thread.sleep(forTimeInterval: $0) }, base: 1 / cps) { fixed += 1 }
+                typed += 1
+                Thread.sleep(forTimeInterval: Typing.delay(after: ch, pos: i, cps: cps, rhythm: rhythm))
+                if !quiet && (Date().timeIntervalSince(lastDraw) > 0.1 || i == chars.count - 1) {
+                    lastDraw = Date()
+                    let p = repeatN == 0 ? Double(i + 1) / Double(chars.count) : Double(typed) / Double(totalKeys)
+                    let w = 28, n = Int(min(1, p) * Double(w))
+                    let bar = c("31", String(repeating: "█", count: n)) + c("2", String(repeating: "░", count: w - n))
+                    let remain = stopAt.map { $0.timeIntervalSinceNow } ?? Double(totalKeys - typed) / cps * rhythm.etaFactor
+                    let r = repeatN == 1 ? "" : "  round \(round)" + (repeatN == 0 ? "" : "/\(repeatN)")
+                    FileHandle.standardError.write("\r  \(bar) \(String(format: "%3d", Int(min(1, p) * 100)))%\(r)  \(Typing.clock(remain)) left   ".data(using: .utf8)!)
+                }
             }
-            if let d = until, i % 10 == 0 {
-                cps = min(600, max(0.02, Double(chars.count - i) * rhythm.etaFactor / max(1, Typing.workSeconds(breaks, from: Date(), to: d))))
+            if repeatN != 0 && round >= repeatN { break }
+            if let s = stopAt, Date() >= s { break }
+            for ch in sepChars {
+                _ = Keys.emit(ch, newline: newline, typoPct: 0, wait: { _ in }, base: 1 / cps)
+                typed += 1
+                Thread.sleep(forTimeInterval: Typing.delay(after: ch, pos: 0, cps: cps, rhythm: rhythm))
             }
-            if noIndent && atLineStart && (ch == " " || ch == "\t") { continue }
-            atLineStart = ch == "\n"
-            if Keys.emit(ch, newline: newline, typoPct: typos, wait: { Thread.sleep(forTimeInterval: $0) }, base: 1 / cps) { fixed += 1 }
-            Thread.sleep(forTimeInterval: Typing.delay(after: ch, pos: i, cps: cps, rhythm: rhythm))
-            if !quiet && (Date().timeIntervalSince(lastDraw) > 0.1 || i == chars.count - 1) {
-                lastDraw = Date()
-                let p = Double(i + 1) / Double(chars.count), w = 28, n = Int(p * Double(w))
-                let bar = c("31", String(repeating: "█", count: n)) + c("2", String(repeating: "░", count: w - n))
-                let remain = Double(chars.count - i - 1) / cps * rhythm.etaFactor
-                FileHandle.standardError.write("\r  \(bar) \(String(format: "%3d", Int(p * 100)))%  \(Typing.clock(remain)) left   ".data(using: .utf8)!)
-            }
+            atLineStart = sepChars.last == "\n"
+            Thread.sleep(forTimeInterval: gap)
+            round += 1
         }
         if !quiet {
-            err("\n" + c("32", "✓ ") + "Typed \(chars.count) keys in \(Typing.clock(Date().timeIntervalSince(start)))" + (fixed > 0 ? ", fixed \(fixed) typos" : "") + ".")
+            err("\n" + c("32", "✓ ") + "Typed \(typed) keys in \(Typing.clock(Date().timeIntervalSince(start)))" + (round > 1 ? ", \(round) rounds" : "") + (fixed > 0 ? ", fixed \(fixed) typos" : "") + ".")
         }
         return 0
     }
